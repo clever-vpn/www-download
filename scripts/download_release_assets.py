@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -12,6 +13,7 @@ from pathlib import Path
 
 
 GITHUB_API = "https://api.github.com"
+SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def fail(message: str) -> "NoReturn":
@@ -87,45 +89,54 @@ def download_asset(url: str, destination: Path, token: str | None) -> str:
     return digest.hexdigest()
 
 
-def render_release_notes(release_tag: str, manifest: dict) -> str:
-    lines = [
-        f"# {release_tag}",
-        "",
-        "Artifacts synced to Cloudflare R2 from source GitHub Releases.",
-        "",
-    ]
-    for source in manifest["sources"]:
-        lines.append(f"## {source['target_dir']} ({source['repo']})")
-        lines.append("")
-        lines.append(f"- Source tag: {source['source_release_tag']}")
-        lines.append(f"- Source release: {source['release_html_url']}")
-        for asset in source["assets"]:
-            lines.append(
-                f"- {asset['name']} -> {asset['r2_key']} (sha256: {asset['sha256']})"
-            )
-        lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+def validate_directory(raw_directory: str) -> str:
+    directory = raw_directory.strip()
+    if not SAFE_SEGMENT_RE.fullmatch(directory):
+        fail(
+            "--directory must be a single path segment using letters, digits, dot, dash or "
+            "underscore, for example stable, test or v2.1.2."
+        )
+    return directory
+
+
+def select_apps(apps: list[dict], requested: str) -> list[dict]:
+    raw = (requested or "").strip()
+    if not raw or raw.lower() == "all":
+        return apps
+
+    available = [app["target_dir"] for app in apps]
+    selected: list[str] = []
+    for item in raw.split(","):
+        name = item.strip()
+        if not name:
+            continue
+        if name not in available:
+            fail(f"Unknown app '{name}'. Valid values: {', '.join(available)} or all.")
+        if name not in selected:
+            selected.append(name)
+
+    if not selected:
+        fail("No app selected. Use a comma-separated list of target_dir values or all.")
+
+    return [app for app in apps if app["target_dir"] in selected]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--release-tag", required=True)
+    parser.add_argument("--directory", required=True)
+    parser.add_argument("--apps", default="all")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
+    directory = validate_directory(args.directory)
+    apps = select_apps(load_config(Path(args.config)), args.apps)
     token = os.environ.get("SOURCE_GH_TOKEN") or os.environ.get("GH_TOKEN")
-    output_dir = Path(args.output_dir)
-    release_root = output_dir / args.release_tag
-    release_root.mkdir(parents=True, exist_ok=True)
 
-    manifest = {
-        "release_tag": args.release_tag,
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "sources": [],
-    }
+    directory_root = Path(args.output_dir) / directory
+    directory_root.mkdir(parents=True, exist_ok=True)
 
-    for app in load_config(Path(args.config)):
+    for app in apps:
         source_release_tag = app["source_release_tag"].strip()
         release = github_json(
             f"/repos/{app['repo']}/releases/tags/{source_release_tag}", token, allow_404=True
@@ -141,37 +152,51 @@ def main() -> None:
                 f"Release {source_release_tag} in {app['repo']} has no assets matching {app['asset_suffixes']}."
             )
 
-        target_dir = release_root / app["target_dir"]
+        target_dir = directory_root / app["target_dir"]
         target_dir.mkdir(parents=True, exist_ok=True)
-        manifest_source = {
+        manifest = {
+            "directory": directory,
+            "platform": app["target_dir"],
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "repo": app["repo"],
-            "target_dir": app["target_dir"],
             "source_release_tag": source_release_tag,
             "release_html_url": release.get("html_url"),
             "assets": [],
         }
 
         for asset in assets:
-            destination = target_dir / asset["name"]
+            name = asset["name"]
+            if "/" in name or "\\" in name or name in {".", ".."}:
+                fail(f"Release asset name {name!r} is not a safe file name.")
+
+            destination = target_dir / name
             sha256 = download_asset(asset["browser_download_url"], destination, token)
-            manifest_source["assets"].append(
+
+            actual_size = destination.stat().st_size
+            expected_size = asset.get("size")
+            if expected_size is not None and actual_size != expected_size:
+                fail(
+                    f"Downloaded {name} is {actual_size} bytes but GitHub reports "
+                    f"{expected_size} bytes."
+                )
+
+            manifest["assets"].append(
                 {
-                    "name": asset["name"],
-                    "size": asset.get("size"),
+                    "name": name,
+                    "size": actual_size,
                     "sha256": sha256,
                     "download_url": asset.get("browser_download_url"),
-                    "r2_key": f"{args.release_tag}/{app['target_dir']}/{asset['name']}",
+                    "r2_key": f"{directory}/{app['target_dir']}/{name}",
                 }
             )
 
-        manifest["sources"].append(manifest_source)
-
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
-    (output_dir / "release-notes.md").write_text(
-        render_release_notes(args.release_tag, manifest), encoding="utf-8"
-    )
+        (target_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        print(
+            f"{app['target_dir']}: {len(manifest['assets'])} asset(s) from "
+            f"{app['repo']}@{source_release_tag}"
+        )
 
 
 if __name__ == "__main__":

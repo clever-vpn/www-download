@@ -3,34 +3,25 @@ name: Publish Apps To R2
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Optional tag for this repository release and the top-level R2 directory, for example v1.2.3
+      directory:
+        description: Top-level R2 directory to sync, for example stable, test or v2.1.2
+        required: true
+        type: string
+      apps:
+        description: Comma-separated target_dir values to publish, or all
         required: false
+        default: all
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  prepare:
+  publish:
     runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.resolve.outputs.release_tag }}
-      target_commit: ${{ steps.resolve.outputs.target_commit }}
-      tag_exists: ${{ steps.resolve.outputs.tag_exists }}
-      version_source: ${{ steps.resolve.outputs.version_source }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Resolve release tag and target commit
-        id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-        run: python3 scripts/resolve_release.py
 
       - name: Validate optional Bitwarden source token wiring
         if: ${{ vars.BW_SECRET_ID_SOURCE_GH_TOKEN != '' }}
@@ -63,33 +54,14 @@ jobs:
       - name: Download source release assets
         env:
           SOURCE_GH_TOKEN: ${{ env.SOURCE_GH_TOKEN }}
+          DIRECTORY: ${{ inputs.directory }}
+          APPS: ${{ inputs.apps }}
         run: |
           python3 scripts/download_release_assets.py \
             --config config/apps.json \
-            --release-tag "${{ steps.resolve.outputs.release_tag }}" \
+            --directory "${DIRECTORY}" \
+            --apps "${APPS}" \
             --output-dir bundle
-
-      - name: Upload prepared bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: prepared-release-bundle
-          path: bundle
-          if-no-files-found: error
-
-  publish:
-    runs-on: ubuntu-latest
-    needs: prepare
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download prepared bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: prepared-release-bundle
-          path: bundle
 
       - name: Validate Bitwarden wiring
         env:
@@ -120,54 +92,61 @@ jobs:
             ${{ vars.BW_SECRET_ID_R2_ACCESS_KEY_ID }} > R2_ACCESS_KEY_ID
             ${{ vars.BW_SECRET_ID_R2_SECRET_ACCESS_KEY }} > R2_SECRET_ACCESS_KEY
 
-      - name: Sync files to Cloudflare R2
+      - name: Sync platform directories to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
           AWS_EC2_METADATA_DISABLED: true
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           R2_ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          aws s3 sync \
-            "bundle/${RELEASE_TAG}/" \
-            "s3://${R2_BUCKET}/${RELEASE_TAG}/" \
-            --endpoint-url "${R2_ENDPOINT}" \
-            --delete \
-            --no-progress
-
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          TARGET_COMMIT: ${{ needs.prepare.outputs.target_commit }}
-          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+          DIRECTORY: ${{ inputs.directory }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
 
-          tag_created=0
-          cleanup() {
-            if [[ "$tag_created" == "1" ]]; then
-              git push origin ":refs/tags/${RELEASE_TAG}"
-            fi
-          }
-          trap cleanup ERR
-
-          if [[ "$TAG_EXISTS" != "true" ]]; then
-            git push origin "${TARGET_COMMIT}:refs/tags/${RELEASE_TAG}"
-            tag_created=1
+          platforms=(bundle/"${DIRECTORY}"/*/)
+          if [[ ${#platforms[@]} -eq 0 ]]; then
+            echo "Nothing to sync: bundle/${DIRECTORY} has no platform directory." >&2
+            exit 1
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release edit "$RELEASE_TAG" \
-              --title "$RELEASE_TAG" \
-              --notes-file bundle/release-notes.md
-            gh release upload "$RELEASE_TAG" bundle/manifest.json --clobber
-          else
-            gh release create "$RELEASE_TAG" bundle/manifest.json \
-              --target "$TARGET_COMMIT" \
-              --title "$RELEASE_TAG" \
-              --notes-file bundle/release-notes.md
-          fi
+          for platform_path in "${platforms[@]}"; do
+            platform="$(basename "${platform_path}")"
+            echo "::group::Sync ${DIRECTORY}/${platform}"
+            aws s3 sync \
+              "${platform_path}" \
+              "s3://${R2_BUCKET}/${DIRECTORY}/${platform}/" \
+              --endpoint-url "${R2_ENDPOINT}" \
+              --delete \
+              --no-progress
+            echo "::endgroup::"
+          done
 
-          trap - ERR
+      - name: Summarize the published directory
+        env:
+          DIRECTORY: ${{ inputs.directory }}
+        run: |
+          set -euo pipefail
+          python3 - "${DIRECTORY}" >>"${GITHUB_STEP_SUMMARY}" <<'PY'
+          import glob
+          import json
+          import sys
+
+          directory = sys.argv[1]
+
+          print("## R2 directory updated\n")
+          print(f"- Directory: `{directory}`")
+          print(
+              "- Serve it by pointing KV `download-version` (prod) or "
+              "`download-test-version` (test) at this directory.\n"
+          )
+          print("| Platform | Source repo | Source tag | Files |")
+          print("| --- | --- | --- | --- |")
+          for path in sorted(glob.glob(f"bundle/{directory}/*/manifest.json")):
+              with open(path, encoding="utf-8") as handle:
+                  manifest = json.load(handle)
+              print(
+                  f"| {manifest['platform']} | {manifest['repo']} | "
+                  f"{manifest['source_release_tag']} | {len(manifest['assets'])} |"
+              )
+          PY

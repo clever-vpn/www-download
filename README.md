@@ -1,10 +1,10 @@
-# App Download Release Workflow
+# App Download Publishing Workflow
 
 This repository exists only to collect app artifacts from other repositories' GitHub Releases and publish them into Cloudflare R2.
 
 ## Configuration
 
-Edit `config/apps.json` and list each source repository, the destination folder under the release tag, and the asset suffixes to copy.
+Edit `config/apps.json` and list each source repository, the destination platform folder, and the asset suffixes to copy.
 
 ```json
 {
@@ -25,18 +25,32 @@ Edit `config/apps.json` and list each source repository, the destination folder 
 }
 ```
 
-The workflow input `tag` is only for this repository's release tag and the top-level R2 directory name. Each source repository release tag is read from `source_release_tag` in the config file.
+The workflow input `directory` is the top-level R2 directory to sync, and it is the only version identity this repository manages. Each source repository and its release tag are read from `source_release_tag` in the config file.
 
-Each workflow run writes files to `R2_BUCKET/<tag>/<target_dir>/...`.
+Use a channel name such as `stable` or `test` when the content is meant to be updated in place, or a snapshot name such as `v2.1.2` when the content must never change. Downloads bind to a directory through the worker KV key, so serving a new version, rolling back, or separating production from test is only a matter of pointing KV at another directory.
+
+Each workflow run writes files to `R2_BUCKET/<directory>/<target_dir>/...`.
+
+The optional `apps` input restricts a run to specific `target_dir` values, for example `windows`, so upgrading one platform does not download, upload or delete anything for the other platforms. Leave it at `all` to sync every entry in `config/apps.json`.
 
 ## Workflow behavior
 
-The manual workflow is defined in `.github/workflows/publish-to-r2.yml`.
+The manual workflow is defined in `.github/workflows/publish-to-r2.yml`. It runs as a single job and never uploads GitHub Actions artifacts.
 
-- If `tag` is provided and already exists in this repository, the workflow uses the commit currently pointed to by that tag.
-- If `tag` is provided and does not exist, the workflow uses `main` HEAD during prepare, then creates the missing tag only in the final publish stage.
-- If `tag` is omitted, the workflow reads the latest GitHub Release tag in this repository, increments the patch version, and uses that `v`-prefixed tag. If no release exists yet, it starts at `v0.0.1`.
-- If a newly created tag cannot be paired with a successful GitHub Release write, the workflow deletes that tag before the job exits with failure.
+- `directory` must be a single path segment made of letters, digits, dot, dash or underscore. It is validated before anything is downloaded.
+- Every asset of every selected source release that matches `asset_suffixes` is downloaded from the source repository, and its size is checked against what GitHub reports.
+- Each platform is synced with `aws s3 sync --delete`, scoped to `R2_BUCKET/<directory>/<target_dir>/`. Files that disappeared from the source release are removed inside that platform folder only; other platform folders in the same directory are never touched.
+- A `manifest.json` describing the source repository, the source release tag, the file sizes and the `sha256` of every file is written into each platform folder, so it is published and replaced together with the content it describes.
+- No git tag and no GitHub Release is created. The workflow only needs read access to this repository.
+
+## Serving a directory
+
+The download worker reads the top-level directory name from KV and serves files from it:
+
+- Production worker: KV key `download-version`
+- Test worker: KV key `download-test-version`
+
+Pointing either key at another directory switches what that worker serves, which is how a rollback or a test rollout is done. The frontend does not need to change, because the public download URLs are version-free.
 
 ## Required GitHub secrets and variables
 

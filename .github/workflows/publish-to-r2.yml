@@ -7,6 +7,10 @@ on:
         description: Top-level R2 directory to sync, for example stable, test or v2.1.2
         required: true
         type: string
+      tag:
+        description: Optional existing tag to publish from, for example v2.1.2. Defaults to the branches/main HEAD
+        required: false
+        type: string
       apps:
         description: Comma-separated target_dir values to publish, or all
         required: false
@@ -20,8 +24,45 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Resolve target commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          api="repos/${GITHUB_REPOSITORY}"
+
+          if [[ -n "${INPUT_TAG}" ]]; then
+            stderr_file="$(mktemp)"
+            if ! gh api "${api}/git/ref/tags/${INPUT_TAG}" --silent 2>"${stderr_file}"; then
+              if grep -q "HTTP 404" "${stderr_file}"; then
+                echo "Tag ${INPUT_TAG} does not exist in ${GITHUB_REPOSITORY}." >&2
+                echo "Create it first, or leave the tag input empty to publish from the branches/main HEAD." >&2
+              else
+                echo "Could not look up tag ${INPUT_TAG}:" >&2
+                cat "${stderr_file}" >&2
+              fi
+              rm -f "${stderr_file}"
+              exit 1
+            fi
+            rm -f "${stderr_file}"
+
+            # /commits/{ref} 会把 annotated tag 剥离到 commit，省掉一次 git/tags 查询
+            target_commit="$(gh api "${api}/commits/${INPUT_TAG}" --jq .sha)"
+            echo "Publishing from tag ${INPUT_TAG} at ${target_commit}."
+          else
+            target_commit="$(gh api "${api}/branches/main" --jq .commit.sha)"
+            echo "Publishing from branches/main HEAD at ${target_commit}."
+          fi
+
+          echo "target_commit=${target_commit}" >>"${GITHUB_OUTPUT}"
+
+      - name: Checkout repository at target commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.target_commit }}
 
       - name: Validate optional Bitwarden source token wiring
         if: ${{ vars.BW_SECRET_ID_SOURCE_GH_TOKEN != '' }}
@@ -125,17 +166,19 @@ jobs:
       - name: Summarize the published directory
         env:
           DIRECTORY: ${{ inputs.directory }}
+          COMMIT: ${{ steps.resolve.outputs.target_commit }}
         run: |
           set -euo pipefail
-          python3 - "${DIRECTORY}" >>"${GITHUB_STEP_SUMMARY}" <<'PY'
+          python3 - "${DIRECTORY}" "${COMMIT}" >>"${GITHUB_STEP_SUMMARY}" <<'PY'
           import glob
           import json
           import sys
 
-          directory = sys.argv[1]
+          directory, commit = sys.argv[1], sys.argv[2]
 
           print("## R2 directory updated\n")
           print(f"- Directory: `{directory}`")
+          print(f"- Published from commit `{commit}`")
           print(
               "- Serve it by pointing KV `download-version` (prod) or "
               "`download-test-version` (test) at this directory.\n"

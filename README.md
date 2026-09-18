@@ -38,7 +38,7 @@ The optional `apps` input restricts a run to specific `target_dir` values, for e
 The manual workflow is defined in `.github/workflows/publish-to-r2.yml`. It runs as a single job and never uploads GitHub Actions artifacts.
 
 - `directory` must be a single path segment made of letters, digits, dot, dash or underscore. It is validated before anything is downloaded.
-- `tag` is optional and must already exist. The workflow resolves it to a commit and checks out that revision, so what a run publishes is defined by the `config/apps.json` of that tag. When the input is empty, the `branches/main` HEAD is used. Tags that predate the current tooling cannot be used, because the scripts that run come from the same checked out revision.
+- `tag` is optional and must already exist. It selects which revision of `config/apps.json` defines the content: the workflow resolves the tag to a commit and reads that file from it. When the input is empty, the `branches/main` HEAD is used. The workflow file and the scripts always come from the revision the run was dispatched on, so any existing tag stays usable.
 - Every asset of every selected source release that matches `asset_suffixes` is downloaded from the source repository, and its size is checked against what GitHub reports.
 - Each platform is synced with `aws s3 sync --delete`, scoped to `R2_BUCKET/<directory>/<target_dir>/`. Files that disappeared from the source release are removed inside that platform folder only; other platform folders in the same directory are never touched.
 - A `manifest.json` describing the source repository, the source release tag, the file sizes and the `sha256` of every file is written into each platform folder, so it is published and replaced together with the content it describes.

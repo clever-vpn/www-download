@@ -59,10 +59,21 @@ jobs:
 
           echo "target_commit=${target_commit}" >>"${GITHUB_OUTPUT}"
 
-      - name: Checkout repository at target commit
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.resolve.outputs.target_commit }}
+
+      - name: Use config from the target commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_COMMIT: ${{ steps.resolve.outputs.target_commit }}
+        run: |
+          set -euo pipefail
+
+          # 只从 target commit 取配置；workflow 与 scripts 始终用触发本次运行的 revision
+          gh api "repos/${GITHUB_REPOSITORY}/contents/config/apps.json?ref=${TARGET_COMMIT}" \
+            -H "Accept: application/vnd.github.raw" > config/apps.json
+
+          echo "Using config/apps.json from ${TARGET_COMMIT}."
 
       - name: Validate optional Bitwarden source token wiring
         if: ${{ vars.BW_SECRET_ID_SOURCE_GH_TOKEN != '' }}

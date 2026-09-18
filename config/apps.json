@@ -2,7 +2,7 @@
   "apps": [
     {
       "repo": "clever-vpn/clever-vpn-client-windows",
-      "source_release_tag": "v2.1.5",
+      "source_release_tag": "v2.1.6",
       "target_dir": "windows",
       "asset_suffixes": [".exe", ".msi"]
     },
